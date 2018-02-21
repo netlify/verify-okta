@@ -1,0 +1,13 @@
+hash: 3c09a4a949e94b49fbd787171d7f5db7d679d7d56dff6c770bec402029eb0642
+updated: 2018-02-20T23:13:10.025931763-08:00
+imports:
+- name: github.com/aws/aws-lambda-go
+  version: fafa7e49388b8991caf99308e80655ba91816b72
+  subpackages:
+  - events
+  - lambda
+  - lambda/messages
+  - lambdacontext
+- name: github.com/dgrijalva/jwt-go
+  version: dbeaa9332f19a944acb5736b4456cfcc02140e29
+testImports: []

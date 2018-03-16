@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -44,7 +45,7 @@ type response struct {
 	Status string `json:"status"`
 }
 
-func handleLogin(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+func handleLogin(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	var d data
 	if err := json.NewDecoder(strings.NewReader(request.Body)).Decode(&d); err != nil {
 		return events.APIGatewayProxyResponse{
@@ -116,7 +117,7 @@ func handleLogin(request events.APIGatewayProxyRequest) (events.APIGatewayProxyR
 	if oktaResp.Status != "ACTIVE" {
 		return events.APIGatewayProxyResponse{
 			StatusCode: 500,
-			Body:       fmt.Sprintf("Session status was not active (%v)", oktaResp.Status),
+			Body:       fmt.Sprintf("Session status was not active (%v)", oktaResp),
 		}, nil
 	}
 
@@ -156,7 +157,7 @@ func handleLogin(request events.APIGatewayProxyRequest) (events.APIGatewayProxyR
 	}, nil
 }
 
-func handleJS(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+func handleJS(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	baseURL := os.Getenv("OKTA_BASE_URL")
 	if baseURL == "" {
 		return events.APIGatewayProxyResponse{
@@ -172,10 +173,51 @@ func handleJS(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResp
 		}, nil
 	}
 
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		return events.APIGatewayProxyResponse{
+			StatusCode: 500,
+			Body:       "No JWT_SECRET in environment",
+		}, nil
+	}
+
+	cookieVal, ok := request.Headers["cookie"]
+	fmt.Printf("Headers: %v\n", request.Headers)
+	if ok {
+		fmt.Println("Got a cookie from the headers")
+		header := http.Header{}
+		header.Add("Cookie", cookieVal)
+		r := http.Request{Header: header}
+		cookie, err := r.Cookie("nf_jwt")
+		fmt.Printf("Error in cookie: %v\n", err)
+		if err == nil && cookie != nil {
+			token, err := jwt.Parse(cookie.Value, func(token *jwt.Token) (interface{}, error) {
+				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+					fmt.Printf("Bad signing method %v\n", token.Header["alg"])
+					return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+				}
+				fmt.Println("Verifying JWT")
+				return []byte(jwtSecret), nil
+			})
+			fmt.Printf("Verified: %v - %v\n", err, token.Valid)
+			if err == nil && token.Valid {
+				return jsBody(authenticatedJS(baseURL, clientID)), nil
+			}
+		}
+	}
+	return jsBody(unauthenticatedJS(baseURL, clientID)), nil
+}
+
+func jsBody(js string) events.APIGatewayProxyResponse {
 	return events.APIGatewayProxyResponse{
 		StatusCode: 200,
 		Headers:    map[string]string{"Content-Type": "text/javascript"},
-		Body: `
+		Body:       js,
+	}
+}
+
+func baseJS(baseURL, clientID string) string {
+	return `
 		var baseURL = "` + baseURL + `";
 		var clientId = "` + clientID + `";
 		var oktaCDN = "https://ok1static.oktacdn.com/assets/js/sdk/okta-signin-widget/2.6.0";
@@ -183,31 +225,66 @@ func handleJS(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResp
 		var css = ["/css/okta-sign-in.min.css", "/css/okta-theme.css"];
 
 		function addScript(script, cb) {
-		  var tag = document.createElement("script");
-		  tag.onload = cb;
-		  tag.src = oktaCDN + script;
-		  document.head.appendChild(tag);
+			var tag = document.createElement("script");
+			tag.onload = cb;
+			tag.src = oktaCDN + script;
+			document.head.appendChild(tag);
 		}
 
 		function addCSS(url) {
-		  var tag = document.createElement("link");
-		  tag.rel = "stylesheet";
-		  tag.href = oktaCDN + url;
-		  document.head.appendChild(tag);
+			var tag = document.createElement("link");
+			tag.rel = "stylesheet";
+			tag.href = oktaCDN + url;
+			document.head.appendChild(tag);
 		}
 
+		function ajax(method, url, body, cb) {
+			var request = new window.XMLHttpRequest();
+			request.open(method, url);
+			request.addEventListener("load", function (e) {
+			cb(request.status == 200 ? null : request);
+			});
+			request.send(body);
+		}
+`
+}
+
+func authenticatedJS(baseURL, clientID string) string {
+	return baseJS(baseURL, clientID) + `
+		function signOut(e) {
+			e.preventDefault();
+
+			var oktaSignIn = new OktaSignIn({
+				baseUrl: baseURL,
+				clientId: clientId,
+				authParams: {
+					issuer: baseURL + "/oauth2/default",
+					responseType: ['id_token'],
+					display: 'page'
+				}
+			});
+
+			oktaSignIn.session.close(function(err) {
+				ajax("DELETE", "/.netlify/functions/verify-okta", "", function(err) {
+					document.location.reload();
+				});
+			});
+		}
+
+		addScript(js, function () {
+			var els = document.getElementsByClassName("okta-signout");
+			for (var i=0; i<els.length; i++) {
+				var el = els[i];
+				el.addEventListener("click", signOut)	;
+			}
+		})`
+}
+
+func unauthenticatedJS(baseURL, clientID string) string {
+	return baseJS(baseURL, clientID) + `
 		css.forEach(function (href) {
 		  addCSS(href);
 		});
-
-		function ajax(method, url, body, cb) {
-		  var request = new window.XMLHttpRequest();
-		  request.open(method, url);
-		  request.addEventListener("load", function (e) {
-			cb(request.status == 200 ? null : request);
-		  });
-		  request.send(body);
-		}
 
 		addScript(js, function () {
 		  var oktaSignIn = new OktaSignIn({
@@ -219,64 +296,63 @@ func handleJS(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResp
 			  display: 'page'
 			}
 		  });
-		  if (oktaSignIn.token.hasTokensInUrl()) {
-			oktaSignIn.token.parseTokensFromUrl(
-			  function success(res) {
-				var idToken = res[0];
-				// Remove the tokens from the window location hash
-				window.location.hash = '';
-				ajax("POST", "/.netlify/functions/verify-okta", JSON.stringify({ okta_id: idToken.id }), function (err) {
-				  if (err) {
-					console.error("Error setting session cookie: ", err);
-					return;
-				  }
-				  document.location.reload();
-				});
-			  },
-			  function error(err) {
-				// handle errors as needed
-				console.error(err);
-			  }
-			);
-		  } else {
+
 			oktaSignIn.session.get(function (res) {
 			  // Session exists, show logged in state.
 			  if (res.status === 'ACTIVE') {
-				console.log("AJAX!!!");
-				ajax("POST", "/.netlify/functions/verify-okta", JSON.stringify({ okta_id: res.id }), function (err) {
-				  if (err) {
-					console.error("Error setting session cookie: ", err);
+					ajax("POST", "/.netlify/functions/verify-okta", JSON.stringify({ okta_id: res.id }), function (err) {
+						if (err) {
+						console.error("Error setting session cookie for existing session: ", err);
+						return;
+						}
+						document.location.reload();
+					});
 					return;
-				  }
-				  document.location.reload();
-				});
-				return;
 			  }
 			  // No session, show the login form
 			  oktaSignIn.renderEl(
-				{ el: '#okta-login-container' },
-				function success(res) {
-				  // Nothing to do in this case, the widget will automatically redirect
-				  // the user to Okta for authentication, then back to this page if successful
-				},
-				function error(err) {
-				  // handle errors as needed
-				  console.error(err);
-				}
+					{ el: '#okta-login-container' },
+					function success(res) {
+						res.session.setCookieAndRedirect(document.location.href);
+						return;
+					},
+					function error(err) {
+						// handle errors as needed
+						console.error(err);
+					}
 			  );
 			});
-		  }
-		});`,
+		});`
+}
+
+func handleLogout(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	cookie := http.Cookie{
+		Name:     "nf_jwt",
+		Path:     "/",
+		MaxAge:   -1,
+		Expires:  time.Now().Add(-100 * time.Hour),
+		Secure:   true,
+		HttpOnly: true,
+	}
+
+	return events.APIGatewayProxyResponse{
+		StatusCode: 200,
+		Body:       "{}",
+		Headers:    map[string]string{"Set-Cookie": cookie.String()},
 	}, nil
 }
 
-func handler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	if request.HTTPMethod == "GET" && strings.HasSuffix(request.Path, "/okta.js") {
-		return handleJS(request)
+		return handleJS(ctx, request)
 	}
 
 	if request.HTTPMethod == "POST" {
-		return handleLogin(request)
+		return handleLogin(ctx, request)
+	}
+
+	if request.HTTPMethod == "DELETE" {
+		return handleLogout(ctx, request)
 	}
 
 	return events.APIGatewayProxyResponse{
@@ -299,7 +375,10 @@ func (l *LocalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	req := events.APIGatewayProxyRequest{
 		Body: string(body),
 	}
-	resp, err := handler(req)
+	for k, v := range r.Header {
+		req.Headers[strings.ToLower(k)] = v[0]
+	}
+	resp, err := handler(r.Context(), req)
 	if err != nil {
 		log.Printf("Error handling request: %v", err)
 		w.WriteHeader(500)
